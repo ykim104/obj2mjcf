@@ -39,6 +39,7 @@ class Material:
         else:
             alpha = "1.0"
         # TODO(kevin): Figure out how to use Ka for computing rgba.
+        alpha = str(max(0.5, float(alpha)))
         return f"{Kd} {alpha}"
 
     def mjcf_shininess(self) -> str:

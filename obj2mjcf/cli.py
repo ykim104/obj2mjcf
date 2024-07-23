@@ -7,6 +7,7 @@ import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Optional
+import json 
 
 import trimesh
 import tyro
@@ -16,7 +17,8 @@ from termcolor import cprint
 from obj2mjcf import constants
 from obj2mjcf.material import Material
 from obj2mjcf.mjcf_builder import MJCFBuilder
-
+from obj2mjcf.utils import convert_unity_json_to_nested_dict, split_obj_by_geometry
+from obj2mjcf.category_utils import categories_joint_map, find_value_by_key_substring
 
 @dataclass(frozen=True)
 class CoacdArgs:
@@ -50,6 +52,8 @@ class Args:
     obj_dir: str
     """path to a directory containing obj files. All obj files in the directory will be
     converted"""
+    texture_dir: str = ""
+    """path to a directory containing texture files."""
     obj_filter: Optional[str] = None
     """only convert obj files matching this regex"""
     save_mjcf: bool = False
@@ -68,6 +72,7 @@ class Args:
     """overwrite previous run output"""
     add_free_joint: bool = False
     """add a free joint to the root body"""
+    category: str = ""
 
 
 def resize_texture(filename: Path, resize_percent) -> None:
@@ -126,11 +131,6 @@ def process_obj(filename: Path, args: Args) -> None:
     work_dir.mkdir(exist_ok=True)
     logging.info(f"Saving processed meshes to {work_dir}")
 
-    # Decompose the mesh into convex pieces if desired.
-    decomp_success = False
-    if args.decompose:
-        decomp_success = decompose_convex(filename, work_dir, args.coacd_args)
-
     # Check if the OBJ files references an MTL file.
     # TODO(kevin): Should we support multiple MTL files?
     process_mtl = False
@@ -171,7 +171,7 @@ def process_obj(filename: Path, args: Args) -> None:
             sub_mtls[-1].append(line)
         for sub_mtl in sub_mtls:
             mtls.append(Material.from_string(sub_mtl))
-
+        
         # Process each material.
         for mtl in mtls:
             logging.info(f"Found material: {mtl.name}")
@@ -179,11 +179,14 @@ def process_obj(filename: Path, args: Args) -> None:
                 texture_path = Path(mtl.map_Kd)
                 texture_name = texture_path.name
                 src_filename = filename.parent / texture_path
+                
+                src_filename = args.texture_dir / texture_path
                 if not src_filename.exists():
                     raise RuntimeError(
                         f"The texture file {src_filename} referenced in the MTL file "
                         f"{mtl.name} does not exist"
                     )
+                    
                 # We want a flat directory structure in work_dir.
                 dst_filename = work_dir / texture_name
                 shutil.copy(src_filename, dst_filename)
@@ -196,51 +199,90 @@ def process_obj(filename: Path, args: Args) -> None:
                     texture_name = dst_filename.name
                     mtl.map_Kd = texture_name
                 resize_texture(dst_filename, args.texture_resize_percent)
+        
+        mat_dict = {}
+        for mtl in mtls:
+            mat_dict[mtl.name] = mtl
         logging.info("Done processing MTL file")
+        
+    # Check if there is JSON File 
+    meshes_hierarchy = None
+    json_file = filename.parent / f"{filename.stem}.json"
+    if json_file.exists():
+        logging.info(f"Found JSON file: {json_file}")
+        # Load JSON file
+        with open(json_file, "r") as f:
+            data = json.load(f)
+        meshes_hierarchy = convert_unity_json_to_nested_dict(data)
+    logging.info("Done processing JSON file", meshes_hierarchy)
+    
+    # Split OBJ into Sub Meshes
+    submesh_filenames, saved_filenames = split_obj_by_geometry(filename)
+    logging.info(f"Splitting OBJ into {len(submesh_filenames)} submeshes")
+ 
+    meshes = {}
+    mtls = {}
+    for i, saved_filename in enumerate(saved_filenames):    
+        logging.info("Processing OBJ file with trimesh")
+        sub_filename = Path(submesh_filenames[i])
+        saved_filename = Path(saved_filename)
+        
+        mesh = trimesh.load(
+            saved_filename,
+            split_object=False,
+            group_material=False,
+            process=False,
+            # Note setting this to False is important. Without it, there are a lot of weird
+            # visual artifacts in the texture.        
+            maintain_order=True, # False NOTE: why did Yejin set to true?
+        )
+        
+        logging.info(f"Components Material: {mesh}")
 
-    logging.info("Processing OBJ file with trimesh")
-    mesh = trimesh.load(
-        filename,
-        split_object=True,
-        group_material=True,
-        process=False,
-        # Note setting this to False is important. Without it, there are a lot of weird
-        # visual artifacts in the texture.
-        maintain_order=False,
-    )
+        
+        if isinstance(mesh, trimesh.base.Trimesh):
+            # No submeshes, just save the mesh.
+            savename = work_dir / f"{saved_filename.stem}_0.obj"
+            logging.info(f"Saving mesh {savename}")
+            mesh.export(savename.as_posix(), include_texture=True, header=None)
 
-    if isinstance(mesh, trimesh.base.Trimesh):
-        # No submeshes, just save the mesh.
-        savename = work_dir / f"{filename.stem}.obj"
-        logging.info(f"Saving mesh {savename}")
-        mesh.export(savename.as_posix(), include_texture=True, header=None)
-    else:
-        logging.info("Grouping and saving submeshes by material")
-        for i, geom in enumerate(mesh.geometry.values()):  # type: ignore
-            savename = work_dir / f"{filename.stem}_{i}.obj"
-            logging.info(f"Saving submesh {savename}")
-            geom.export(savename.as_posix(), include_texture=True, header=None)
+            # Decompose the mesh into convex pieces if desired.
+            decomp_success = False
+            if args.decompose:
+                decomp_success = decompose_convex(savename, work_dir, args.coacd_args)
+                logging.info(f"Decomposition {savename} success: {decomp_success}")
 
-    # Edge case handling where the material file can have many materials but the OBJ
-    # itself only references one. In that case, we trim out the extra materials and
-    # only keep the one that is referenced.
-    if isinstance(mesh, trimesh.base.Trimesh) and len(mtls) > 1:
-        # Find the material that is referenced.
-        with open(filename, "r") as f:
+        else:
+            # NOTE: We do NOT want to group submeshes
+            #logging.info("Grouping and saving submeshes by material")
+            logging.info("Saving submeshes")
+            for i, geom in enumerate(mesh.geometry.values()):  # type: ignore
+                savename = work_dir / f"{saved_filename.stem}_{i}.obj"
+                logging.info(f"Saving submesh {savename}")
+                geom.export(savename.as_posix(), include_texture=True, header=None)
+
+                # Decompose the mesh into convex pieces if desired.
+                decomp_success = False
+                if args.decompose:
+                    decomp_success = decompose_convex(savename, work_dir, args.coacd_args)
+                    logging.info(f"Decomposition {savename} success: {decomp_success}")
+        meshes[sub_filename.stem] = mesh        
+        #TODO: delete original mesh filename 
+   
+        _mtls = []
+        with open(saved_filename, "r") as f:
             lines = f.readlines()
         for i, line in enumerate(lines):
             if line.startswith("usemtl"):
-                break
-        mat_name = line.split()[1]
-        # Trim out the extra materials.
-        for smtl in sub_mtls:
-            if smtl[0].split()[1] == mat_name:
-                break
-        sub_mtls = [smtl]
-        mtls = [Material.from_string(smtl)]
-
-    mtls = list({obj.name: obj for obj in mtls}.values())
-
+                mat_name = line.split()[1]
+                logging.info(f"Processing material: {mat_name}")
+                logging.info(f"Processed materials: {mat_dict}")
+                _mtls.append(mat_dict[mat_name])
+   
+        mtls[sub_filename.stem] = _mtls
+        logging.info(f"Processed materials: {_mtls}")
+        
+        
     # Delete any MTL files that were created during trimesh processing, if any.
     for file in [
         x
@@ -249,9 +291,15 @@ def process_obj(filename: Path, args: Args) -> None:
     ]:
         file.unlink()
 
+
     # Build an MJCF.
-    builder = MJCFBuilder(filename, mesh, mtls, decomp_success=decomp_success)
-    builder.build(add_free_joint=args.add_free_joint)
+    joint_map = None
+    if args.category in categories_joint_map:
+        joint_map = find_value_by_key_substring(categories_joint_map[args.category], filename.stem)
+    logging.info(f"Building MJCF for category {joint_map}")
+        
+    builder = MJCFBuilder(filename, meshes, mtls, meshes_hierarchy, decomp_success=decomp_success)
+    builder.build(add_free_joint=args.add_free_joint, add_joints=joint_map)
 
     # Compile and step the physics to check for any errors.
     if args.compile_model:
